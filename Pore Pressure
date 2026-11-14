@@ -1,0 +1,170 @@
+# ============================================================
+# PORE PRESSURE PREDICTION USING EATON'S METHOD
+# ============================================================
+import os
+import urllib.request
+import lasio
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+# ------------------------------------------------------------
+# 1) CONFIGURATION  Adjust these parameters for your well
+# ------------------------------------------------------------
+FILE_PATH = "well_data.las"  # Local LAS file name
+DEPTH_IN_FEET = (
+    True  # Set True if log depth is in feet (sample.las uses feet)
+)
+WATER_DEPTH = 0.0  # Water depth in meters (0 for onshore wells)
+AIR_GAP = 0.0  # Kelly Bushing (KB) elevation above sea level, meters
+GR_CUTOFF = 80.0  # Gamma Ray cutoff for shale discrimination (API)
+NCT_TOP = 150.0  # Top of Normal Compaction Trend (NCT) interval, meters
+NCT_BASE = 450.0  # Base of Normal Compaction Trend (NCT) interval, meters
+EATON_EXPONENT = 3.0  # Standard Eaton exponent for sonic logs (typically 3.0)
+
+FLUID_DENSITY = 1030.0  # Formation water / seawater density (kg/m3)
+GRAVITY = 9.81  # Acceleration due to gravity (m/s2)
+
+# Automatically download an open-source sample LAS file if local file is missing
+if not os.path.exists(FILE_PATH):
+    SAMPLE_URL = "https://raw.githubusercontent.com/bolivdata/lasio/master/tests/examples/sample.las"
+    print(f"'{FILE_PATH}' not found locally. Downloading sample LAS file...")
+    urllib.request.urlretrieve(SAMPLE_URL, FILE_PATH)
+
+# ------------------------------------------------------------
+# 2) LOAD & PARSE WELL LOG DATA
+# ------------------------------------------------------------
+las = lasio.read(FILE_PATH)
+df = las.df()
+df.columns = [c.upper() for c in df.columns]
+
+depth = np.array(df.index, dtype=float)
+if DEPTH_IN_FEET:
+    depth = depth * 0.3048  # Convert feet to meters
+
+# Extract required curves (handles common curve aliases if needed)
+gr = np.array(
+    df["GR"], dtype=float
+)  # Gamma Ray (API) - Note: check column name if using sample.las
+rhob = np.array(df["RHOB"], dtype=float)  # Bulk Density (g/cc)
+dt = np.array(df["DT"], dtype=float)  # Compressional Sonic Transit Time (us/ft)
+
+print(f"Depth Interval: {depth.min():.1f} - {depth.max():.1f} m")
+print(f"GR Range: {np.nanmin(gr):.1f} - {np.nanmax(gr):.1f} API")
+
+# ------------------------------------------------------------
+# 3) SHALE DISCRIMINATION (Eaton's method applies to shales)
+# ------------------------------------------------------------
+shale_mask = (gr >= GR_CUTOFF) & ~np.isnan(dt)
+print(f"Shale Data Points: {shale_mask.sum()} / {len(depth)}")
+
+# ------------------------------------------------------------
+# 4) OVERBURDEN STRESS (Sv): Cumulative weight of overlying rock
+# ------------------------------------------------------------
+# Forward-fill missing (NaN) density values using the first valid reading
+first_valid_rho = rhob[~np.isnan(rhob)][0]
+for i in range(len(rhob)):
+    if np.isnan(rhob[i]):
+        if i > 0 and not np.isnan(rhob[i - 1]):
+            rhob[i] = rhob[i - 1]
+        else:
+            rhob[i] = first_valid_rho
+
+z_tvd = depth - AIR_GAP  # True Vertical Depth below sea level
+dz = np.diff(z_tvd, prepend=z_tvd[0])  # Thickness step
+
+# Overburden = Water column + Shallow section above log + Integrated log density
+sv_top = FLUID_DENSITY * GRAVITY * WATER_DEPTH + rhob[0] * 1000.0 * GRAVITY * (
+    z_tvd[0] - WATER_DEPTH
+)
+sv = (sv_top + np.cumsum(rhob * 1000.0 * GRAVITY * dz)) / 1e6  # MPa
+
+# ------------------------------------------------------------
+# 5) HYDROSTATIC PRESSURE (Ph): Normal formation fluid pressure
+# ------------------------------------------------------------
+ph = FLUID_DENSITY * GRAVITY * z_tvd / 1e6  # MPa
+
+# ------------------------------------------------------------
+# 6) NORMAL COMPACTION TREND (NCT)
+# ------------------------------------------------------------
+z_bml = z_tvd - WATER_DEPTH  # Depth below mudline / ground level
+nct_mask = shale_mask & (depth >= NCT_TOP) & (depth <= NCT_BASE)
+print(f"NCT Calibration Points: {nct_mask.sum()}")
+
+# Linear regression in semi-log space: ln(DT) = a + b * depth
+slope, intercept = np.polyfit(z_bml[nct_mask], np.log(dt[nct_mask]), 1)
+print(f"NCT Slope (b): {slope:.6f} (must be negative for normal compaction)")
+dt_normal = np.exp(intercept + slope * z_bml)
+
+# ------------------------------------------------------------
+# 7) EATON'S PORE PRESSURE EQUATION
+# ------------------------------------------------------------
+sonic_ratio = np.minimum(
+    dt_normal / dt, 1.0
+)  # Cap at 1.0 to avoid sub-hydrostatic artifacts
+pp_shale = sv - (sv - ph) * (sonic_ratio**EATON_EXPONENT)
+
+# Apply a 21-point rolling median filter to remove high-frequency spikes
+pp_smooth = (
+    pd.Series(pp_shale[shale_mask])
+    .rolling(21, center=True, min_periods=1)
+    .median()
+    .values
+)
+
+# Interpolate shale pore pressure across non-shale (sand/carbonate) intervals
+pp = np.interp(depth, depth[shale_mask], pp_smooth)
+pp = np.maximum(pp, ph)  # Ensure pore pressure is at least hydrostatic
+
+# ------------------------------------------------------------
+# 8) VISUALIZATION & DATA EXPORT
+# ------------------------------------------------------------
+fig, ax = plt.subplots(1, 3, figsize=(12, 8), sharey=True)
+
+# Track 1: Sonic Transit Time & Normal Compaction Trend
+ax[0].semilogx(dt, depth, color="lightgray", label="DT (All Lithologies)")
+ax[0].semilogx(dt[shale_mask], depth[shale_mask], ".", ms=2, label="DT (Shale)")
+ax[0].semilogx(dt_normal, depth, "r--", lw=1.5, label="NCT")
+ax[0].axhspan(NCT_TOP, NCT_BASE, color="yellow", alpha=0.2, label="NCT Interval")
+ax[0].set_xlabel("Sonic DT [us/ft]")
+ax[0].grid(True, which="both", ls=":", alpha=0.6)
+ax[0].legend(loc="lower left", fontsize=8)
+
+# Track 2: Gamma Ray & Shale Cutoff
+ax[1].plot(gr, depth, "g", lw=0.7)
+ax[1].axvline(GR_CUTOFF, color="k", ls="--", label=f"Cutoff ({GR_CUTOFF} API)")
+ax[1].set_xlabel("Gamma Ray [API]")
+ax[1].grid(True, ls=":", alpha=0.6)
+ax[1].legend(loc="lower right", fontsize=8)
+
+# Track 3: Subsurface Pressure Profiles
+ax[2].plot(ph, depth, "b-", lw=1.5, label="Hydrostatic (Ph)")
+ax[2].plot(pp, depth, "r-", lw=1.8, label="Pore Pressure (Eaton)")
+ax[2].plot(sv, depth, "k-", lw=1.5, label="Overburden (Sv)")
+ax[2].set_xlabel("Pressure [MPa]")
+ax[2].grid(True, ls=":", alpha=0.6)
+ax[2].legend(loc="lower left", fontsize=8)
+
+ax[0].set_ylabel("Depth [m]")
+ax[0].invert_yaxis()
+plt.suptitle(
+    "Subsurface Pore Pressure Prediction (Eaton's Sonic Method)",
+    fontsize=12,
+    fontweight="bold",
+)
+plt.tight_layout()
+plt.savefig("pore_pressure_profile.png", dpi=200)
+
+# Export results to CSV
+output_data = np.column_stack([depth, ph, pp, sv])
+np.savetxt(
+    "pore_pressure_results.csv",
+    output_data,
+    delimiter=",",
+    header="Depth_m,Hydrostatic_MPa,Pore_Pressure_MPa,Overburden_MPa",
+    comments="",
+)
+
+print(
+    "Process complete: 'pore_pressure_profile.png' and 'pore_pressure_results.csv' generated."
+)
